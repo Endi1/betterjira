@@ -139,6 +139,24 @@ Returns the parsed JSON response.  MAX-RESULTS defaults to `betterjira-max-resul
         (pop-to-buffer buf)
         (goto-char (point-min))))))
 
+(defun betterjira-debug-transitions ()
+  "Debug: show raw transitions response for the issue at point."
+  (interactive)
+  (let* ((issue-key (betterjira--issue-key-at-point))
+         (url (betterjira--api-url
+               (format "/rest/api/3/issue/%s/transitions?expand=transition.fields"
+                       issue-key)))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (message "Request URL: %s" url)
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (let ((buf (get-buffer-create "*BetterJira-Debug*")))
+        (copy-to-buffer buf (point-min) (point-max))
+        (pop-to-buffer buf)
+        (goto-char (point-min))))))
+
 ;;; --- Cache (SQLite) ---
 
 (defconst betterjira--cache-file
@@ -534,6 +552,206 @@ Returns the parsed JSON response from Jira."
       (message "Created %s: %s" key url)
       (when (y-or-n-p (format "Open %s in browser? " key))
         (browse-url url)))))
+
+;;; --- Issue actions from Org buffer ---
+
+(defun betterjira--issue-key-at-point ()
+  "Return the Jira issue key for the Org heading at point.
+Searches the heading text for a key like PROJ-123."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((heading (org-get-heading t t t t)))
+      (if (string-match "\\b\\([A-Z][A-Z0-9]+-[0-9]+\\)\\b" heading)
+          (match-string 1 heading)
+        (error "No Jira issue key found in heading: %s" heading)))))
+
+(defun betterjira--get-my-account-id ()
+  "Fetch the current user's Jira account ID."
+  (let* ((url (betterjira--api-url "/rest/api/3/myself"))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (re-search-forward "\n\n")
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (body (json-read)))
+          (unless (= status-code 200)
+            (error "Jira API error (%d): %s" status-code body))
+          (alist-get 'accountId body))))))
+
+(defun betterjira--assign-issue (issue-key account-id)
+  "Assign ISSUE-KEY to the user with ACCOUNT-ID."
+  (let* ((url (betterjira--api-url
+               (format "/rest/api/3/issue/%s/assignee" issue-key)))
+         (url-request-method "PUT")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json")))
+         (url-request-data (json-encode `((accountId . ,account-id)))))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (unless (= status-code 204)
+          (re-search-forward "\n\n")
+          (let* ((json-object-type 'alist)
+                 (json-array-type 'list)
+                 (body (json-read)))
+            (error "Jira API error (%d): %s" status-code body)))))))
+
+(defun betterjira--fetch-single-issue (issue-key)
+  "Fetch a single issue by ISSUE-KEY with standard fields."
+  (let* ((fields (url-hexify-string betterjira--issue-fields))
+         (url (betterjira--api-url
+               (format "/rest/api/3/issue/%s?fields=%s" issue-key fields)))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (re-search-forward "\n\n")
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (body (json-read)))
+          (unless (= status-code 200)
+            (error "Jira API error (%d): %s" status-code body))
+          body)))))
+
+(defun betterjira--refresh-heading-at-point (issue)
+  "Replace the Org heading at point with refreshed ISSUE data."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (org-back-to-heading t)
+      (let ((beg (point)))
+        (org-end-of-subtree t t)
+        ;; If not at end of buffer, we're at the start of the next heading
+        ;; If at end of buffer, include any trailing newline
+        (delete-region beg (point))
+        (goto-char beg)
+        (insert (betterjira--format-issue-org issue))))))
+
+(defun betterjira-assign-to-me ()
+  "Assign the Jira issue at point to the current user and refresh the heading."
+  (interactive)
+  (let ((issue-key (betterjira--issue-key-at-point)))
+    (message "Assigning %s to you..." issue-key)
+    (let ((account-id (betterjira--get-my-account-id)))
+      (betterjira--assign-issue issue-key account-id)
+      (let ((updated-issue (betterjira--fetch-single-issue issue-key)))
+        (betterjira--refresh-heading-at-point updated-issue)
+        (message "Assigned %s to you." issue-key)))))
+
+(defun betterjira--fetch-transitions (issue-key)
+  "Fetch available status transitions for ISSUE-KEY.
+Includes field metadata (e.g. whether resolution is required).
+Returns a list of transition alists."
+  (let* ((url (betterjira--api-url
+               (format "/rest/api/3/issue/%s/transitions?expand=transition.fields"
+                       issue-key)))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (re-search-forward "\n\n")
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (body (json-read)))
+          (unless (= status-code 200)
+            (error "Jira API error (%d): %s" status-code body))
+          (alist-get 'transitions body))))))
+
+(defun betterjira--fetch-resolutions ()
+  "Fetch available resolutions from Jira.
+Returns a list of alists with `id' and `name' keys."
+  (let* ((url (betterjira--api-url "/rest/api/3/resolution"))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (re-search-forward "\n\n")
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (body (json-read)))
+          (unless (= status-code 200)
+            (error "Jira API error (%d): %s" status-code body))
+          body)))))
+
+(defun betterjira--transition-needs-resolution-p (transition)
+  "Return non-nil if TRANSITION likely requires a resolution.
+Checks if the target status category is \"done\"."
+  (let* ((to (alist-get 'to transition))
+         (category (alist-get 'statusCategory to))
+         (key (alist-get 'key category)))
+    (string= key "done")))
+
+(defun betterjira--transition-issue (issue-key transition-id &optional resolution-name)
+  "Transition ISSUE-KEY to the state identified by TRANSITION-ID.
+If RESOLUTION-NAME is non-nil, include it in the transition."
+  (let* ((url (betterjira--api-url
+               (format "/rest/api/3/issue/%s/transitions" issue-key)))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json")))
+         (payload (if resolution-name
+                     `((transition (id . ,transition-id))
+                       (fields (resolution (name . ,resolution-name))))
+                   `((transition (id . ,transition-id)))))
+         (url-request-data (json-encode payload)))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (unless (= status-code 204)
+          (re-search-forward "\n\n")
+          (let* ((json-object-type 'alist)
+                 (json-array-type 'list)
+                 (body (json-read)))
+            (error "Jira API error (%d): %s" status-code body)))))))
+
+(defun betterjira-change-status ()
+  "Prompt for a new status and transition the issue at point.
+Only shows valid transitions for the issue's current state.
+If the transition requires a resolution, prompts for one."
+  (interactive)
+  (let* ((issue-key   (betterjira--issue-key-at-point))
+         (transitions (betterjira--fetch-transitions issue-key))
+         (names       (mapcar (lambda (tr) (alist-get 'name tr)) transitions)))
+    (unless transitions
+      (error "No transitions available for %s" issue-key))
+    (let* ((selected (completing-read
+                      (format "Transition %s to: " issue-key) names nil t))
+           (transition (seq-find (lambda (tr)
+                                   (string= (alist-get 'name tr) selected))
+                                 transitions))
+           (transition-id (alist-get 'id transition))
+           (resolution-name
+            (when (betterjira--transition-needs-resolution-p transition)
+              (let* ((resolutions (betterjira--fetch-resolutions))
+                     (res-names (mapcar (lambda (r) (alist-get 'name r))
+                                        resolutions)))
+                (completing-read "Resolution: " res-names nil t)))))
+      (message "Transitioning %s to %s..." issue-key selected)
+      (betterjira--transition-issue issue-key transition-id resolution-name)
+      (let ((updated-issue (betterjira--fetch-single-issue issue-key)))
+        (betterjira--refresh-heading-at-point updated-issue)
+        (message "Transitioned %s to %s." issue-key selected)))))
 
 (provide 'betterjira)
 
