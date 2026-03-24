@@ -753,6 +753,59 @@ If the transition requires a resolution, prompts for one."
         (betterjira--refresh-heading-at-point updated-issue)
         (message "Transitioned %s to %s." issue-key selected)))))
 
+(defun betterjira--org-heading-summary ()
+  "Return the plain text summary from the Org heading at point.
+Strips TODO keywords and any existing Jira links."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((heading (org-get-heading t t t t)))
+      ;; Strip any existing [[...][KEY]] link
+      (if (string-match "\\[\\[[^]]*\\]\\[[^]]*\\]\\]\\s-*" heading)
+          (replace-match "" t t heading)
+        heading))))
+
+(defun betterjira--org-body-text ()
+  "Return the body text of the Org entry at point.
+Excludes the heading line and any properties drawer."
+  (save-excursion
+    (org-back-to-heading t)
+    (forward-line 1)
+    ;; Skip properties drawer if present
+    (when (looking-at "\\s-*:PROPERTIES:")
+      (re-search-forward ":END:" nil t)
+      (forward-line 1))
+    (let ((beg (point))
+          (end (save-excursion
+                 (org-end-of-subtree t t)
+                 (point))))
+      (string-trim
+       (replace-regexp-in-string
+        "^  " ""
+        (buffer-substring-no-properties beg end))))))
+
+(defun betterjira-create-issue-from-heading ()
+  "Create a Jira issue from the Org heading at point.
+Uses the heading text as the summary and the body as the description.
+Prompts for issue type, then creates the issue and replaces the
+heading in place with the full Jira issue data."
+  (interactive)
+  (let* ((summary     (betterjira--org-heading-summary))
+         (description (betterjira--org-body-text))
+         (issue-types (betterjira--fetch-issue-types))
+         (type-names  (mapcar (lambda (it) (alist-get 'name it)) issue-types))
+         (type-name   (completing-read "Issue type: " type-names nil t))
+         (type-id     (alist-get 'id (seq-find (lambda (it)
+                                                  (string= (alist-get 'name it) type-name))
+                                                issue-types))))
+    (when (string-empty-p summary)
+      (error "Heading has no summary text"))
+    (message "Creating %s \"%s\" in %s..." type-name summary betterjira-project-key)
+    (let* ((response (betterjira--create-issue summary description type-id))
+           (key      (alist-get 'key response))
+           (issue    (betterjira--fetch-single-issue key)))
+      (betterjira--refresh-heading-at-point issue)
+      (message "Created %s: %s" key (betterjira--issue-url key)))))
+
 (provide 'betterjira)
 
 ;;; betterjira.el ends here
