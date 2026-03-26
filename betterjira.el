@@ -328,14 +328,36 @@ If a status is not found here, it is uppercased and used directly."
                 ""))))
    (t "")))
 
-(defun betterjira--extract-pr-url (description-adf)
-  "Extract a pull request URL from DESCRIPTION-ADF if present.
-Looks for GitHub/GitLab/Bitbucket URLs in the document."
-  (let ((text (betterjira--extract-text description-adf)))
-    (when (string-match
-           "https?://[^ \n]*\\(?:pull\\|merge_requests\\|pull-requests\\)[^ \n]*"
-           text)
-      (match-string 0 text))))
+(defun betterjira--fetch-pr-urls (issue-id)
+  "Fetch pull request URLs linked to ISSUE-ID via the dev-status API.
+Returns a list of (URL . TITLE) cons cells, or nil."
+  (let* ((url (betterjira--api-url
+               (format "/rest/dev-status/latest/issue/detail?issueId=%s&applicationType=GitHub&dataType=pullrequest"
+                       issue-id)))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json"))))
+    (condition-case nil
+        (with-current-buffer (url-retrieve-synchronously url t)
+          (goto-char (point-min))
+          (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+          (let ((status-code (string-to-number (match-string 1))))
+            (re-search-forward "\n\n")
+            (when (= status-code 200)
+              (let* ((json-object-type 'alist)
+                     (json-array-type 'list)
+                     (body (json-read))
+                     (detail (alist-get 'detail body))
+                     (prs (apply #'append
+                                 (mapcar (lambda (d)
+                                           (alist-get 'pullRequests d))
+                                         detail))))
+                (mapcar (lambda (pr)
+                          (cons (alist-get 'url pr)
+                                (alist-get 'name pr)))
+                        prs)))))
+      (error nil))))
 
 (defun betterjira--format-issue-org (issue)
   "Format a single ISSUE alist as an Org heading."
@@ -353,11 +375,12 @@ Looks for GitHub/GitLab/Bitbucket URLs in the document."
          (epic-key  (when parent-data (alist-get 'key parent-data)))
          (epic-summary (when parent-data
                          (alist-get 'summary (alist-get 'fields parent-data))))
+         (issue-id (alist-get 'id issue))
          (description-adf (alist-get 'description fields))
          (description (if description-adf
                           (string-trim (betterjira--extract-text description-adf))
                         ""))
-         (pr-url (betterjira--extract-pr-url description-adf))
+         (pr-links (when issue-id (betterjira--fetch-pr-urls issue-id)))
          (org-status (betterjira--status-to-org-state status)))
     (concat (format "* %s [[%s][%s]] %s\n"
                     org-status
@@ -374,8 +397,12 @@ Looks for GitHub/GitLab/Bitbucket URLs in the document."
                         epic-key
                         (or epic-summary ""))
               "  :EPIC:     None\n")
-            (if pr-url
-                (format "  :PR:       [[%s][Link]]\n" pr-url)
+            (if pr-links
+                (mapconcat (lambda (pr)
+                             (format "  :PR:       [[%s][%s]]\n"
+                                     (car pr)
+                                     (or (cdr pr) "Link")))
+                           pr-links "")
               "  :PR:       None\n")
             "  :END:\n"
             (if (string-empty-p description)
@@ -805,6 +832,39 @@ heading in place with the full Jira issue data."
            (issue    (betterjira--fetch-single-issue key)))
       (betterjira--refresh-heading-at-point issue)
       (message "Created %s: %s" key (betterjira--issue-url key)))))
+
+(defun betterjira--slugify (text)
+  "Convert TEXT to a lowercase kebab-case slug suitable for a branch name."
+  (let* ((down (downcase text))
+         (clean (replace-regexp-in-string "[^a-z0-9 ]" "" down))
+         (trimmed (string-trim clean))
+         (slug (replace-regexp-in-string "\\s-+" "-" trimmed)))
+    slug))
+
+(defun betterjira-copy-branch-name ()
+  "Generate a git branch name from the Jira issue at point and copy it.
+Produces a branch like: AISHOPPING-901/deploy-prod-vespa-application"
+  (interactive)
+  (let* ((issue-key (betterjira--issue-key-at-point))
+         (summary (save-excursion
+                    (org-back-to-heading t)
+                    (let ((heading (org-get-heading t t t t)))
+                      ;; Strip [[...][KEY]] link
+                      (when (string-match "\\[\\[[^]]*\\]\\[[^]]*\\]\\]\\s-*" heading)
+                        (setq heading (replace-match "" t t heading)))
+                      heading)))
+         (branch (format "%s-%s" issue-key (betterjira--slugify summary))))
+    (kill-new branch)
+    (message "Copied: %s" branch)))
+
+(defun betterjira-refresh-issue ()
+  "Refresh the Jira issue at point with the latest data."
+  (interactive)
+  (let* ((issue-key (betterjira--issue-key-at-point)))
+    (message "Refreshing %s..." issue-key)
+    (let ((issue (betterjira--fetch-single-issue issue-key)))
+      (betterjira--refresh-heading-at-point issue)
+      (message "Refreshed %s." issue-key))))
 
 (provide 'betterjira)
 
