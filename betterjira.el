@@ -857,6 +857,53 @@ Produces a branch like: AISHOPPING-901/deploy-prod-vespa-application"
     (kill-new branch)
     (message "Copied: %s" branch)))
 
+(defun betterjira--update-issue (issue-key summary description priority-name)
+  "Update ISSUE-KEY on Jira with SUMMARY, DESCRIPTION, and PRIORITY-NAME."
+  (let* ((url (betterjira--api-url
+               (format "/rest/api/3/issue/%s" issue-key)))
+         (url-request-method "PUT")
+         (url-request-extra-headers
+          `(("Authorization" . ,(betterjira--auth-header))
+            ("Content-Type"  . "application/json")))
+         (payload `((fields
+                     (summary . ,summary)
+                     (priority (name . ,priority-name))
+                     (description
+                      (type . "doc")
+                      (version . 1)
+                      (content . [((type . "paragraph")
+                                   (content . [((type . "text")
+                                                (text . ,description))]))])))))
+         (url-request-data (json-encode payload)))
+    (with-current-buffer (url-retrieve-synchronously url t)
+      (goto-char (point-min))
+      (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+      (let ((status-code (string-to-number (match-string 1))))
+        (unless (= status-code 204)
+          (re-search-forward "\n\n")
+          (let* ((json-object-type 'alist)
+                 (json-array-type 'list)
+                 (body (json-read)))
+            (error "Jira API error (%d): %s" status-code body)))))))
+
+(defun betterjira-push-issue ()
+  "Push the Org entry at point back to Jira.
+Updates the summary (heading), description (body), and priority
+on the Jira ticket, then refreshes the entry with the latest data."
+  (interactive)
+  (let* ((issue-key   (betterjira--issue-key-at-point))
+         (summary     (betterjira--org-heading-summary))
+         (description (betterjira--org-body-text))
+         (priority    (or (org-entry-get (point) "PRIORITY")
+                          "Normal")))
+    (when (string-empty-p summary)
+      (error "Heading has no summary text"))
+    (message "Pushing %s to Jira..." issue-key)
+    (betterjira--update-issue issue-key summary description priority)
+    (let ((issue (betterjira--fetch-single-issue issue-key)))
+      (betterjira--refresh-heading-at-point issue)
+      (message "Pushed %s to Jira." issue-key))))
+
 (defun betterjira-refresh-issue ()
   "Refresh the Jira issue at point with the latest data."
   (interactive)
