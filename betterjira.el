@@ -359,9 +359,13 @@ Returns a list of (URL . TITLE) cons cells, or nil."
                         prs)))))
       (error nil))))
 
-(defun betterjira--format-issue-org (issue)
-  "Format a single ISSUE alist as an Org heading."
-  (let* ((key     (alist-get 'key issue))
+(defun betterjira--format-issue-org (issue &optional level)
+  "Format a single ISSUE alist as an Org heading.
+LEVEL is the heading depth (number of stars); defaults to 1."
+  (let* ((level   (or level 1))
+         (stars   (make-string level ?*))
+         (indent  (make-string (1+ level) ?\s))
+         (key     (alist-get 'key issue))
          (fields  (alist-get 'fields issue))
          (summary (alist-get 'summary fields))
          (status  (alist-get 'name (alist-get 'status fields)))
@@ -381,37 +385,52 @@ Returns a list of (URL . TITLE) cons cells, or nil."
                           (string-trim (betterjira--extract-text description-adf))
                         ""))
          (pr-links (when issue-id (betterjira--fetch-pr-urls issue-id)))
+         (subtasks (when key (betterjira--fetch-subtasks key)))
          (org-status (betterjira--status-to-org-state status)))
-    (concat (format "* %s [[%s][%s]] %s\n"
+    (concat (format "%s %s [[%s][%s]] %s\n"
+                    stars
                     org-status
                     (betterjira--issue-url key)
                     key
                     (or summary "No summary"))
-            "  :PROPERTIES:\n"
-            (format "  :STATUS:   %s\n" (or status "Unknown"))
-            (format "  :PRIORITY: %s\n" priority)
-            (format "  :ASSIGNEE: %s\n" assignee)
+            (format "%s:PROPERTIES:\n" indent)
+            (format "%s:STATUS:   %s\n" indent (or status "Unknown"))
+            (format "%s:JIRA-PRIORITY: %s\n" indent priority)
+            (format "%s:ASSIGNEE: %s\n" indent assignee)
             (if epic-key
-                (format "  :EPIC:     [[%s][%s]] %s\n"
+                (format "%s:EPIC:     [[%s][%s]] %s\n"
+                        indent
                         (betterjira--issue-url epic-key)
                         epic-key
                         (or epic-summary ""))
-              "  :EPIC:     None\n")
+              (format "%s:EPIC:     None\n" indent))
             (if pr-links
                 (mapconcat (lambda (pr)
-                             (format "  :PR:       [[%s][%s]]\n"
+                             (format "%s:PR:       [[%s][%s]]\n"
+                                     indent
                                      (car pr)
                                      (or (cdr pr) "Link")))
                            pr-links "")
-              "  :PR:       None\n")
-            "  :END:\n"
+              (format "%s:PR:       None\n" indent))
+            (format "%s:END:\n" indent)
             (if (string-empty-p description)
                 ""
               (concat "\n"
-                      (mapconcat (lambda (line) (concat "  " line))
+                      (mapconcat (lambda (line) (concat indent line))
                                  (split-string description "\n")
                                  "\n")
-                      "\n")))))
+                      "\n"))
+            (if subtasks
+                (concat (unless (string-empty-p description) "")
+                        (mapconcat (lambda (sub)
+                                     (let* ((sf (alist-get 'fields sub))
+                                            (ss (alist-get 'summary sf))
+                                            (st (alist-get 'name (alist-get 'status sf)))
+                                            (done (member st '("Done" "Closed" "Resolved"))))
+                                       (format "%s- [%s] %s" indent (if done "X" " ") ss)))
+                                   subtasks "\n")
+                        "\n")
+              ""))))
 
 (defun betterjira-list-issues ()
   "Prompt for a status, then fetch and display matching issues in an Org buffer."
@@ -653,17 +672,17 @@ Searches the heading text for a key like PROJ-123."
           body)))))
 
 (defun betterjira--refresh-heading-at-point (issue)
-  "Replace the Org heading at point with refreshed ISSUE data."
+  "Replace the Org heading at point with refreshed ISSUE data.
+Preserves the current heading level."
   (let ((inhibit-read-only t))
     (save-excursion
       (org-back-to-heading t)
-      (let ((beg (point)))
+      (let ((level (org-current-level))
+            (beg (point)))
         (org-end-of-subtree t t)
-        ;; If not at end of buffer, we're at the start of the next heading
-        ;; If at end of buffer, include any trailing newline
         (delete-region beg (point))
         (goto-char beg)
-        (insert (betterjira--format-issue-org issue))))))
+        (insert (betterjira--format-issue-org issue level))))))
 
 (defun betterjira-assign-to-me ()
   "Assign the Jira issue at point to the current user and refresh the heading."
